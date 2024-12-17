@@ -1,0 +1,316 @@
+// Main Parameter 
+SET ThousandSep='.';
+SET DecimalSep=',';
+SET MoneyThousandSep='.';
+SET MoneyDecimalSep=',';
+SET MoneyFormat='#.##0,00 €;-#.##0,00 €';
+SET TimeFormat='hh:mm:ss';
+SET DateFormat='DD.MM.YYYY';
+SET TimestampFormat='DD.MM.YYYY hh:mm:ss[.fff]';
+SET FirstWeekDay=0;
+SET BrokenWeeks=0;
+SET ReferenceDay=4;
+SET FirstMonthOfYear=1;
+SET CollationLocale='de-DE';
+SET CreateSearchIndexOnReload=1;
+SET MonthNames='Jan.;Feb.;März;Apr.;Mai;Juni;Juli;Aug.;Sep.;Okt.;Nov.;Dez.';
+SET LongMonthNames='Januar;Februar;März;April;Mai;Juni;Juli;August;September;Oktober;November;Dezember';
+SET DayNames='Mo.;Di.;Mi.;Do.;Fr.;Sa.;So.';
+SET LongDayNames='Montag;Dienstag;Mittwoch;Donnerstag;Freitag;Samstag;Sonntag';
+SET NumericalAbbreviation='3:k;6:M;9:G;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+// Specific Parameter
+// Den Dateinamen der aktuellsten GlobalData-Datei bestimmen.
+Set vTimeLagFileNameGlobalData = 0;
+// Variablen für die GlobalData Extraktion
+Let vTimestamp = Date(Addmonths(Monthstart(today() ),-1), 'YYYY-MM-DD');
+// Wie viele Monate soll in die Zukunft geschaut werden
+Set vNumberOfForecastMonths = 13;
+// Wie viele Monate soll nach hinten geschaut werden
+Set vNumberOfPastMonths = 13;
+
+// Mapping Daten
+Platform_Zuordnung:
+Mapping LOAD
+	%key_series_project,
+    [platform no.]
+FROM [lib://0000_Resources/0020_QVD_Transform/Dimensions/Dimensions_Serienprojekte.qvd]
+(qvd);
+
+GlobalData_Projektzuordnung:
+Mapping LOAD
+	 "lmca full code",
+    [platform no.]
+FROM [lib://0000_Resources/0020_QVD_Transform/Dimensions/Dimensions_LMC-Projektzuordnung.qvd]
+(qvd);
+
+
+// Initial Load 
+
+GlobalData_Initial:
+LOad *
+FROM [lib://0000_Resources/0020_QVD_Transform/Dimensions/Dimensions_LMC_Daten.qvd] (qvd);
+
+Rename Field [country] to [Global Data country];
+
+NoConcatenate
+GlobalData_total_production_volume:
+Load 
+	Sum([production volume]) as [production volume], 
+	[state month],
+	[platform no.],
+	[production date]
+	group by [state month], [platform no.], [production date];
+	Load 
+		Num([production volume],'##0.00') as [production volume],
+		[state month],
+		applymap('GlobalData_Projektzuordnung', [lmca full code], 'No platform no. found') as [platform no.], 
+		date(date#(text(year) & right(month,3), 'YYYYMMM'), 'DD.MM.YYYY') as [production date]
+		Resident GlobalData_Initial
+;
+
+
+Drop Table GlobalData_Initial;
+
+
+// Temporär einen Kalender aufbauen 
+LET vStartDate = Num(Date('01.01.2020'));
+LET vEndDate = Num(MonthStart(Addmonths(today(), -1)));
+
+		Calendar_Global_Data:
+        
+        LOAD
+
+        Date($(vStartDate) + RangeSum(Peek('RowNum'), 1) - 1) AS [sales date],
+
+        RangeSum(Peek('RowNum'), 1) AS RowNum
+
+        AutoGenerate vEndDate - vStartDate + 1;
+        
+        Drop Field RowNum;
+        
+        Inner join (Calendar_Global_Data) 
+        Load [sales date]
+        Resident Calendar_Global_Data 
+        where [sales date] = monthstart([sales date]);
+        
+        
+        
+        join (Calendar_Global_Data)
+        LOAD Distinct 
+            "platform no."
+        FROM [lib://0000_Resources/0020_QVD_Transform/Dimensions/Dimensions_Serienprojekte.qvd]
+        (qvd);
+
+NoConcatenate
+VerschiedeneMonate:
+Load Distinct [sales date] as [iteration sales date]
+Resident Calendar_Global_Data
+order by [sales date];
+
+// Start der Schleife 
+for each vIterationDate in FieldValueList('iteration sales date')
+
+NoConcatenate
+Current_GlobalData:
+Load * 
+Resident Calendar_Global_Data
+where [sales date] = '$(vIterationDate)';
+       
+  Let FileTimestampGlobalData = Date(Addmonths('$(vIterationDate)', $(vTimeLagFileNameGlobalData) * -1), 'DD.MM.YYYY');
+
+
+NoConcatenate
+GlobalData:
+Load *
+	
+	where  
+	// rollierend nur die letzten 12 Monate laden 
+    [production date] >= AddMonths(Monthstart('$(vIterationDate)'), - $(vNumberOfPastMonths) ) 
+	and [production date] <= AddMonths('$(vIterationDate)', $(vNumberOfForecastMonths));
+
+Load *, 
+ [platform no.] & '|' & [production date] as %key_tmp,
+  ;
+LOAD 
+[platform no.],
+// [lmca full code],
+[production volume],
+[production date]
+Resident GlobalData_total_production_volume
+
+where date([state month], 'DD.MM.YYYY') = '$(FileTimestampGlobalData)' 
+;
+
+
+// 0er Datensätze erzeugen --> Wenn bspw ein LMCFull Code in einem Monat nicht produziert wird, soll ein Datensatz mit Produktionsvolumen 0 angelegt werden 
+NoConcatenate
+GlobalData_Nuller:
+Load Distinct   
+[production date],  
+0 as [production volume]
+Resident GlobalData; 
+
+
+
+join (GlobalData_Nuller)
+Load Distinct
+[platform no.]
+//[lmca full code]
+Resident GlobalData;
+
+
+
+// Nur die "Nuller"-Datensätze behalten
+NoConcatenate
+GlobalData_Nuller_tmp:
+Load *
+Resident GlobalData_Nuller
+// Die Kombination aus Datenstand, Fullcode und dem Monat darf nicht bereits existieren 
+where not exists(%key_tmp,  [platform no.] & '|' & [production date] )
+;
+
+Drop Field %key_tmp;
+
+Drop Table GlobalData_Nuller;
+Rename Table GlobalData_Nuller_tmp to GlobalData_Nuller;
+
+
+// "Nuller"-Datensätze anhängen
+Concatenate(GlobalData)
+Load * 
+Resident GlobalData_Nuller;
+
+
+
+Drop Table GlobalData_Nuller;
+
+
+
+
+
+
+
+ 
+ Generic:
+    Generic 
+    Load 
+    [platform no.],
+    [production date] , 
+    [production volume]
+    Resident GlobalData
+    ;
+
+
+Drop Field [production volume], [production date] from GlobalData;
+
+// Jetzt sind in der GlobalData-Tabelle die Datensätze alle doppelt --> entfernen
+NoConcatenate
+Global_Data_tmp: 
+Load Distinct * 
+Resident GlobalData; 
+
+Drop Table GlobalData; Rename Table Global_Data_tmp to GlobalData;
+
+
+
+// Künstliche Tabelle aufbauen mit der Plattform Nummer als Spalte 
+NoConcatenate
+Produktionsvolumen_Je_LMCA_Full_Code:
+Load * Inline [
+platform no.
+];
+
+
+Let vNoOfTables = NoOfTables();
+Let vIterator = $(vNoOfTables) -1;
+
+// Jede erzeugte Tabelle dranjoinen 
+Do 
+	
+
+    
+    
+    Let vCurrentTable = TableName($(vIterator));
+    
+	
+    
+	if WildMatch('$(vCurrentTable)', 'Generic*') then
+    // if not match ('$(vCurrentTable)', 'GlobalData', 'Facts', 'VerschiedeneMonate', 'Current_Sales_Facts', 'Final_Sales_Facts')   then 
+		
+        Let vOldFieldName = FieldName(2, '$(vCurrentTable)');
+		Let vCurrentDate = Date#( '$(vOldFieldName)' , 'DD.MM.YYYY');
+		Let vDateDiffInMonths = ( year('$(vCurrentDate)') * 12 + month('$(vCurrentDate)') ) -   ( year('$(vIterationDate)') * 12 + month('$(vIterationDate)') ) ;
+		Let vSign = pick(match(Sign($(vDateDiffInMonths)), 1, 0, -1), '+', '+', '');
+    	Let vNewFieldName = 'production volume ' & '$(vSign)' & $(vDateDiffInMonths) & ' months'; 
+        
+        join (Produktionsvolumen_Je_LMCA_Full_Code) 
+        Load
+        [platform no.],
+        Sum([$(vOldFieldName)]) as [$(vNewFieldName)]
+		Resident [$(vCurrentTable)]
+        group by [platform no.];
+        
+        Drop Table [$(vCurrentTable)];
+        
+    End if 
+
+	Let vIterator = $(vIterator) - 1;
+Loop while vIterator > -1
+
+
+
+
+
+
+// Hier die Daten je Plattform zusammensummieren
+
+left join (Current_GlobalData) 
+Load * 
+Resident Produktionsvolumen_Je_LMCA_Full_Code;
+
+Drop Table Produktionsvolumen_Je_LMCA_Full_Code; 
+
+
+
+left join (Current_GlobalData)
+Load 
+	[platform no.],
+	Sum(if([production date] >= '01.04.2020', [production volume], 0 )) as [total production volume since 2020],
+	Sum(if([production date] >= addmonths(Monthstart('$(vIterationDate)'), - 12), [production volume], 0)) as [total production volume last 12 months]
+Resident GlobalData_total_production_volume
+where  [state month] = '$(FileTimestampGlobalData)' 
+and [production date] <= [state month] 
+and  [production date] < '$(vIterationDate)'
+group by [platform no.]
+;
+
+
+Drop Table GlobalData; 
+
+IF NoOfRows('Final_GlobalData') > 0 THEN
+	Concatenate (Final_GlobalData) 
+    Load * 
+    Resident Current_GlobalData;
+    
+    Drop Table Current_GlobalData;
+Else 
+	Rename Table Current_GlobalData to Final_GlobalData;
+End if 
+
+
+// Ende der Schleife
+next;
+
+Drop Table VerschiedeneMonate,  Calendar_Global_Data, GlobalData_total_production_volume; 
+
+// Daten speichern 
+Store Final_GlobalData into 'lib://0000_Resources/0020_QVD_Transform/Facts/DataRobot/GlobalData_ProductionVolumePerProject.qvd' (qvd);
+
+
+
+
+
+        
+  
+
